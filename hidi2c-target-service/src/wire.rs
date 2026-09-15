@@ -582,7 +582,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------
-    // Totality
+    // Sampled sweeps.
+    //
+    // Arbitrary-length byte strings are the one domain in this file too large to walk, so
+    // these two tests sample it. Everything above and below walks its domain in full; the
+    // `sampled` in these names is the difference, and is load-bearing.
     // -----------------------------------------------------------------------------------
 
     fn xorshift(state: &mut u64) -> u64 {
@@ -592,15 +596,40 @@ mod tests {
         *state
     }
 
-    /// `Command::parse` must be total: every byte string either parses or produces a
-    /// `ProtocolError`. There is no input for which it panics, reads out of bounds, or
-    /// overflows.
+    /// The one postcondition these sweeps can check: under explicit framing `SET_REPORT`
+    /// carries the report ID twice - once in the command header, once in the payload - and
+    /// section 7.2.3.1 requires them to agree, so a successful parse must echo the ID the
+    /// header carried.
     ///
-    /// The input space is too large to walk, so this is a fixed-seed deterministic sweep
-    /// rather than an exhaustive one - reproducible on failure, and requiring no
-    /// property-testing dependency.
+    /// `header_id` is the generator's ground truth, not something re-derived from the frame,
+    /// which is what keeps this a check rather than a restatement of the parser.
+    ///
+    /// The larger claim - that `Command::parse` returns rather than panicking, reading out of
+    /// bounds or overflowing - is carried by the call itself: any violation aborts the test.
+    fn assert_set_report_echoes_its_header_id(frame: &[u8], framing: ReportFraming, header_id: u8) {
+        let Ok(Command::SetReport { report, .. }) = Command::parse(frame, framing) else {
+            return;
+        };
+
+        assert_eq!(
+            report.id(),
+            match framing {
+                // Implicit framing is presented to `HidDevice` implementations as report ID 0.
+                ReportFraming::Implicit => ReportId(0),
+                ReportFraming::Explicit => ReportId(header_id),
+            },
+            "{framing:?}, frame {frame:02x?}"
+        );
+    }
+
+    /// `Command::parse` must never panic: every byte string either parses or produces a
+    /// `ProtocolError`.
+    ///
+    /// The input space is arbitrary-length byte strings, which is too large to walk, so this
+    /// is a fixed-seed deterministic sample rather than a proof - reproducible on failure,
+    /// and requiring no property-testing dependency.
     #[test]
-    fn command_parse_is_total_over_arbitrary_frames() {
+    fn parse_never_panics_on_sampled_arbitrary_frames() {
         let mut state = 0x0123_4567_89ab_cdefu64;
 
         for _ in 0..200_000 {
@@ -610,17 +639,39 @@ mod tests {
                 frame.push((xorshift(&mut state) & 0xff) as u8);
             }
 
+            // Nothing stronger to assert: a frame of uniform noise carries no intent to
+            // check the parser against. Returning at all is the claim.
             for framing in BOTH_FRAMINGS {
                 let _ = Command::parse(&frame, framing);
             }
         }
     }
 
-    /// The same totality requirement, biased towards frames that are structurally plausible -
-    /// a valid opcode and Data register address - so the sweep spends its time past the early
-    /// rejections rather than bouncing off them.
+    /// The same requirement, biased towards frames that are structurally plausible - a valid
+    /// opcode, the Data register address, and usually a well-formed report body - so the
+    /// sample spends its time past the early rejections rather than bouncing off them.
+    ///
+    /// Three knobs keep the generator from baking in an assumption about frame shape. Each
+    /// reaches frames the others cannot:
+    ///
+    /// - The extended report-ID byte is emitted independently of whether the sentinel nibble
+    ///   asks for one. A generator that supplies it whenever the sentinel appears is
+    ///   structurally incapable of producing a frame that omits it (section 7.2.2.4), and so
+    ///   can never reach the branch rejecting one.
+    /// - The report body is usually well formed rather than noise. Two random tail bytes are
+    ///   read as a little-endian `wLength`, so noise is a valid one only when its high byte
+    ///   happens to be zero: measured over 20_000_000 frames, a noise-only tail reached a
+    ///   successful `SET_REPORT` about 0.4 times per 200_000-iteration run, leaving roughly
+    ///   two runs in three exercising nothing past the command header. Unlike the knob above
+    ///   this is improbability rather than impossibility, but a postcondition that fires on a
+    ///   coin flip is not one worth writing.
+    /// - The finished frame is sometimes truncated, since a host may stop short anywhere.
+    ///   Truncation cannot substitute for the first knob: it only removes suffixes, so it can
+    ///   never produce the frame whose sentinel promises an extended report ID that is absent
+    ///   *while the register bytes are still present* - where the parser consumes the register
+    ///   low byte as the report ID and then misreads the address.
     #[test]
-    fn command_parse_is_total_over_well_formed_looking_frames() {
+    fn parse_never_panics_on_sampled_plausible_frames() {
         let mut state = 0xfedc_ba98_7654_3210u64;
         const OPCODES: [u8; 4] = [
             Opcode::Reset as u8,
@@ -635,20 +686,60 @@ mod tests {
                 .get((xorshift(&mut state) % OPCODES.len() as u64) as usize)
                 .copied()
                 .unwrap_or(Opcode::Reset as u8);
+            let extended_id = if xorshift(&mut state) & 1 == 0 {
+                Some((xorshift(&mut state) & 0xff) as u8)
+            } else {
+                None
+            };
 
             let mut frame = vec![command_byte, opcode];
-            if command_byte & REPORT_ID_NIBBLE_MASK == EXTENDED_REPORT_ID_SENTINEL {
-                frame.push((xorshift(&mut state) & 0xff) as u8);
-            }
+            frame.extend(extended_id);
             frame.extend_from_slice(&[DATA_REG_LOW, 0x00]);
 
-            let tail = (xorshift(&mut state) % 10) as usize;
-            for _ in 0..tail {
-                frame.push((xorshift(&mut state) & 0xff) as u8);
+            // What `Command::parse` will read as the command header's report ID. When the
+            // sentinel nibble is set but no extended byte was emitted, the parser consumes
+            // the register low byte instead.
+            let header_id = if command_byte & REPORT_ID_NIBBLE_MASK == EXTENDED_REPORT_ID_SENTINEL {
+                extended_id.unwrap_or(DATA_REG_LOW)
+            } else {
+                command_byte & REPORT_ID_NIBBLE_MASK
+            };
+
+            if xorshift(&mut state) & 1 == 0 {
+                let payload_len = (xorshift(&mut state) % 8) as u16;
+                let target = if xorshift(&mut state) & 1 == 0 {
+                    ReportFraming::Implicit
+                } else {
+                    ReportFraming::Explicit
+                };
+
+                frame.extend_from_slice(&(target.header_bytes() + payload_len).to_le_bytes());
+                if target == ReportFraming::Explicit {
+                    // Usually echo the header's ID so the parse can succeed; sometimes
+                    // disagree, which is the only way to reach the mismatch rejection.
+                    frame.push(if xorshift(&mut state).is_multiple_of(4) {
+                        (xorshift(&mut state) & 0xff) as u8
+                    } else {
+                        header_id
+                    });
+                }
+                for _ in 0..payload_len {
+                    frame.push((xorshift(&mut state) & 0xff) as u8);
+                }
+            } else {
+                let tail = (xorshift(&mut state) % 10) as usize;
+                for _ in 0..tail {
+                    frame.push((xorshift(&mut state) & 0xff) as u8);
+                }
+            }
+
+            if xorshift(&mut state) & 1 == 0 {
+                let keep = (xorshift(&mut state) as usize) % (frame.len() + 1);
+                frame.truncate(keep);
             }
 
             for framing in BOTH_FRAMINGS {
-                let _ = Command::parse(&frame, framing);
+                assert_set_report_echoes_its_header_id(&frame, framing, header_id);
             }
         }
     }
