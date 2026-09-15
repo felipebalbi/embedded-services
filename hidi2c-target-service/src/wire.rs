@@ -608,8 +608,9 @@ mod tests {
     // Sampled sweeps.
     //
     // Arbitrary-length byte strings are the one domain in this file too large to walk, so
-    // these two tests sample it. Everything above and below walks its domain in full; the
-    // `sampled` in these names is the difference, and is load-bearing.
+    // these two tests sample it. Every other test here either walks its domain in full or
+    // pins a specific case; the `sampled` in these two names is that difference, and is
+    // load-bearing.
     // -----------------------------------------------------------------------------------
 
     fn xorshift(state: &mut u64) -> u64 {
