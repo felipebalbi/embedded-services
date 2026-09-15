@@ -463,28 +463,51 @@ mod tests {
 
     /// Whatever framing we emit to the host, we must be able to read back. This pins the
     /// length arithmetic on both sides to the same rule.
+    ///
+    /// Section 5.1 caps a report at `2^16 - 4` bytes and [`ReportHeader::new`] rejects any
+    /// payload whose framed length overflows the `u16` field, so the domain is every payload
+    /// length from zero up to `u16::MAX - header_bytes` - 65533 implicit, 65532 explicit.
+    /// That is walkable, so it is walked rather than sampled.
+    ///
+    /// Kept cheap by building the buffer once per framing and rewriting only the two or three
+    /// header bytes per iteration, which makes each round trip O(1) rather than O(payload).
     #[test]
-    fn report_header_round_trips_through_parse_report() {
+    fn report_header_round_trips_through_every_framable_payload_length() {
+        const ID: ReportId = ReportId(0x21);
+
         for framing in BOTH_FRAMINGS {
-            for payload_len in 0..=16usize {
-                let payload: Vec<u8> = (0..payload_len).map(|i| 0xa0u8.wrapping_add(i as u8)).collect();
-                let id = ReportId(0x21);
+            let prefix_len = usize::from(framing.header_bytes());
+            let largest_payload = usize::from(u16::MAX - framing.header_bytes());
 
-                let header = ReportHeader::new(payload.len(), id, framing).unwrap();
-                let mut wire = Vec::from(header.as_bytes());
-                wire.extend_from_slice(&payload);
+            let mut wire = vec![0u8; prefix_len + largest_payload];
+            for (i, byte) in wire.iter_mut().skip(prefix_len).enumerate() {
+                *byte = 0xa0u8.wrapping_add(i as u8);
+            }
 
-                let parsed = parse_report(&wire, framing).unwrap();
-                let context = format!("{framing:?}, payload_len {payload_len}");
+            for payload_len in 0..=largest_payload {
+                let header = ReportHeader::new(payload_len, ID, framing).unwrap();
+                // Panics on a length mismatch, which is itself the check that the header is
+                // exactly as wide as the framing says.
+                wire.get_mut(..prefix_len).unwrap().copy_from_slice(header.as_bytes());
 
-                assert_eq!(parsed.data(), payload.as_slice(), "{context}");
+                let frame = wire.get(..prefix_len + payload_len).unwrap();
+                let parsed = parse_report(frame, framing).unwrap();
+
+                // Identity rather than equality: `parse_report` must hand back exactly the
+                // payload subslice of its input, not merely an equal one. Comparing address
+                // and length keeps this O(1), so the walk stays in milliseconds.
+                let expected = frame.get(prefix_len..).unwrap();
+                assert!(
+                    core::ptr::eq(parsed.data().as_ptr(), expected.as_ptr()) && parsed.data().len() == expected.len(),
+                    "{framing:?}, payload_len {payload_len}"
+                );
                 assert_eq!(
                     parsed.id(),
                     match framing {
                         ReportFraming::Implicit => ReportId(0),
-                        ReportFraming::Explicit => id,
+                        ReportFraming::Explicit => ID,
                     },
-                    "{context}"
+                    "{framing:?}, payload_len {payload_len}"
                 );
             }
         }
@@ -764,9 +787,12 @@ mod tests {
 
     /// The Data register address is mandatory in both report commands (sections 7.2.2.1,
     /// 7.2.3.1); pointing anywhere else is a protocol violation.
+    ///
+    /// The field is 16 bits and the frame is a fixed-size array, so every address the host
+    /// could name is walked rather than sampled.
     #[test]
     fn report_commands_require_the_data_register_address() {
-        for register in 0u16..=0x00ff {
+        for register in 0u16..=u16::MAX {
             let [low, high] = register.to_le_bytes();
             let frame = [0x23, Opcode::SetReport as u8, low, high, 0x04, 0x00, 0x03, 0x5a];
 
